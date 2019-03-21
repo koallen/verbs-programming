@@ -1,11 +1,55 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <infiniband/verbs.h>
+#include <sys/socket.h>
+#include <byteswap.h>
+#include <netinet/in.h>
 
 #define BUFSIZE 1024
 
-int main()
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+static inline uint64_t htonll(uint64_t x) { return bswap_64(x); }
+static inline uint64_t ntohll(uint64_t x) { return bswap_64(x); }
+#elif __BYTE_ORDER == __BIG_ENDIAN
+static inline uint64_t htonll(uint64_t x) { return x; }
+static inline uint64_t ntohll(uint64_t x) { return x; }
+#endif
+
+struct rdma_conn_data_t {
+	uint32_t rkey;
+	uint64_t addr;
+	uint32_t qp_num;
+	uint16_t lid;
+} __attribute__((packed));
+
+typedef struct rdma_conn_data_t rdma_conn_data_t;
+
+int main(int argc, char** argv)
 {
+	// parameter handling
+	if (argc < 2)
+	{
+		fprintf(stderr, "Usage: ib_test s/c [ip] [port]\n");
+		return EXIT_FAILURE;
+	}
+	char mode = *argv[1];
+	if (mode != 's' && mode != 'c')
+	{
+		fprintf(stderr, "Wrong mode! Use either 's' for server or 'c' for client\n");
+		return EXIT_FAILURE;
+	}
+	if (mode == 's')
+		printf("In server mode\n");
+	else
+	{
+		if (argc < 4)
+		{
+			fprintf(stderr, "Please specify server IP and port\n");
+			return EXIT_FAILURE;
+		}
+		printf("In client mode\n");
+	}
+
 	// get devices
 	int num_devices;
 	struct ibv_device ** devices = NULL;
@@ -24,6 +68,8 @@ int main()
 		printf("ibv_open_device() failed.\n");
 		return EXIT_FAILURE;
 	}
+	struct ibv_port_attr port_attr;
+	ibv_query_port(context, 1, &port_attr);
 
 	// create protection domain
 	struct ibv_pd * pd = NULL;
@@ -37,7 +83,8 @@ int main()
 	// register memory region
 	char send_buf[BUFSIZE];
 	struct ibv_mr * mr;
-	mr = ibv_reg_mr(pd, send_buf, BUFSIZE, 0);
+	mr = ibv_reg_mr(pd, send_buf, BUFSIZE, IBV_ACCESS_REMOTE_WRITE |
+		IBV_ACCESS_LOCAL_WRITE);
 	if (!mr)
 	{
 		printf("ibv_reg_mr() failed.\n");
@@ -73,40 +120,148 @@ int main()
 		return EXIT_FAILURE;
 	}
 
+	struct ibv_qp_attr attr;
 	// change qp to INIT state
-	struct ibv_qp_attr attr1 = {
-		.qp_state = IBV_QPS_INIT,
-		.pkey_index = 0,
-		.port_num = 1,
-		.qp_access_flags = 0
-	};
-	ibv_modify_qp(qp, &attr1, IBV_QP_STATE |
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_INIT;
+	attr.pkey_index = 0;
+	attr.port_num = 1;
+	attr.qp_access_flags = 0;
+	if (ibv_modify_qp(qp, &attr,
+		IBV_QP_STATE |
 		IBV_QP_PKEY_INDEX |
 		IBV_QP_PORT |
-		IBV_QP_ACCESS_FLAGS);
+		IBV_QP_ACCESS_FLAGS))
+	{
+		printf("ibv_modify_qp() failed.\n");
+		return EXIT_FAILURE;
+	}
 
 	// exchange connection information
+	struct sockaddr_in address;
+	rdma_conn_data_t local_conn_data, remote_conn_data, tmp_conn_data;
+
+	local_conn_data.rkey = htonl(mr->rkey);
+	local_conn_data.addr = htonll((uintptr_t)mr->addr);
+	local_conn_data.qp_num = htonl(qp->qp_num);
+	local_conn_data.lid = htons(port_attr.lid);
+	if (mode == 's')
+	{
+		int addrlen = sizeof(address);
+		int sd = socket(AF_INET, SOCK_STREAM, 0);
+		address.sin_family = AF_INET;
+		address.sin_addr.s_addr = INADDR_ANY;
+		address.sin_port = htons(8999);
+		bind(sd, (struct sockaddr *)&address, sizeof(address));
+		listen(sd, 1);
+		printf("Waiting for client to connect at 0.0.0.0:8999\n");
+		int conn = accept(sd, NULL, 0);
+		read(conn, (char *)&tmp_conn_data, sizeof(rdma_conn_data_t));
+		write(conn, (char *)&local_conn_data, sizeof(rdma_conn_data_t));
+		close(conn);
+		close(sd);
+	}
+	else
+	{
+		// prepare the buffer with rkey & memory addr
+		int sd = socket(AF_INET, SOCK_STREAM, 0);
+		address.sin_family = AF_INET;
+		address.sin_port = htons(atoi(argv[3]));
+		inet_pton(AF_INET, argv[2], &address.sin_addr);
+		connect(sd, (struct sockaddr *)&address, sizeof(address));
+		write(sd, (char *)&local_conn_data, sizeof(rdma_conn_data_t));
+		read(sd, (char *)&tmp_conn_data, sizeof(rdma_conn_data_t));
+		close(sd);
+	}
+	remote_conn_data.addr = ntohll(tmp_conn_data.addr);
+	remote_conn_data.rkey = ntohl(tmp_conn_data.rkey);
+	remote_conn_data.qp_num = ntohl(tmp_conn_data.qp_num);
+	remote_conn_data.lid = ntohs(tmp_conn_data.lid);
+	printf("Info exchange completed\n");
+	printf("local: %d, remote: %d\n", mr->rkey, remote_conn_data.rkey);
 
 	// change qp to RTR state
-	// change qp to RTS state
-
-	// post send
-	struct ibv_sge sg_list = {
-		.addr = (uint64_t)send_buf,
-		.length = BUFSIZE,
-		.lkey = mr->lkey
-	};
-	struct ibv_send_wr send_wr = {
-		.next = NULL,
-		.sg_list = &sg_list,
-		.num_sge = 1,
-		.opcode = IBV_WR_SEND
-	};
-	struct ibv_send_wr * bad_wr;
-	if (ibv_post_send(qp, &send_wr, &bad_wr))
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTR;
+	attr.path_mtu = IBV_MTU_256;
+	attr.dest_qp_num = 100;
+	attr.rq_psn = 0;
+	attr.max_dest_rd_atomic = 1;
+	attr.min_rnr_timer = 0x12;
+	attr.ah_attr.is_global = 0;
+	attr.ah_attr.dlid = 178;
+	attr.ah_attr.sl = 0;
+	attr.ah_attr.src_path_bits = 0;
+	attr.ah_attr.port_num = 1;
+	if (ibv_modify_qp(qp, &attr,
+		IBV_QP_STATE |
+		IBV_QP_AV |
+		IBV_QP_PATH_MTU |
+		IBV_QP_DEST_QPN |
+		IBV_QP_RQ_PSN |
+		IBV_QP_MAX_DEST_RD_ATOMIC |
+		IBV_QP_MIN_RNR_TIMER))
 	{
-		printf("ibv_post_send() failed.\n");
+		printf("ibv_modify_qp() failed.\n");
 		return EXIT_FAILURE;
+	}
+
+	if (mode == 's')
+	{
+		// change qp to RTS state
+		memset(&attr, 0, sizeof(attr));
+		attr.qp_state = IBV_QPS_RTS;
+		attr.sq_psn = 0;
+		attr.timeout = 0x12;
+		attr.retry_cnt = 6;
+		attr.rnr_retry = 0;
+		attr.max_rd_atomic = 1;
+		if (ibv_modify_qp(qp, &attr,
+			IBV_QP_STATE |
+			IBV_QP_TIMEOUT |
+			IBV_QP_RETRY_CNT |
+			IBV_QP_RNR_RETRY |
+			IBV_QP_SQ_PSN |
+			IBV_QP_MAX_QP_RD_ATOMIC))
+		{
+			printf("ibv_modify_qp() failed.\n");
+			return EXIT_FAILURE;
+		}
+		// post send
+		struct ibv_sge sg_list = {
+			.addr = (uint64_t)send_buf,
+			.length = BUFSIZE,
+			.lkey = mr->lkey
+		};
+		struct ibv_send_wr send_wr = {
+			.next = NULL,
+			.sg_list = &sg_list,
+			.num_sge = 1,
+			.opcode = IBV_WR_RDMA_WRITE,
+			.wr.rdma.remote_addr = remote_conn_data.addr,
+			.wr.rdma.rkey = remote_conn_data.rkey
+		};
+		struct ibv_send_wr * bad_wr;
+		char * message = "hello world!";
+		strncpy(send_buf, message, 12);
+		if (ibv_post_send(qp, &send_wr, &bad_wr))
+		{
+			printf("ibv_post_send() failed.\n");
+			return EXIT_FAILURE;
+		}
+		printf("Sent message: %s\n", message);
+	}
+	else
+	{
+		struct ibv_wc wc;
+		int poll_result;
+		do {
+			poll_result = ibv_poll_cq(cq, 1, &wc);
+		} while (poll_result == 0);
+		if (poll_result > 0)
+		{
+			printf("Received data is %s\n", send_buf);
+		}
 	}
 	
 	// finalize everything
