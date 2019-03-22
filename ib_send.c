@@ -115,7 +115,8 @@ int main(int argc, char** argv)
 			.max_send_sge = 1,
 			.max_recv_sge = 1
 		},
-		.qp_type = IBV_QPT_RC
+		.qp_type = IBV_QPT_RC,
+		.sq_sig_all = 1
 	};
 	qp = ibv_create_qp(pd, &init_attr);
 	if (!qp)
@@ -246,7 +247,7 @@ int main(int argc, char** argv)
 		};
 		struct ibv_send_wr * bad_wr;
 		char * message = "hello world!";
-		strncpy(send_buf, message, 13);
+		strcpy(send_buf, message);
 		if (ibv_post_send(qp, &send_wr, &bad_wr))
 		{
 			printf("ibv_post_send() failed.\n");
@@ -275,16 +276,15 @@ int main(int argc, char** argv)
 	{
 		struct ibv_wc wc;
 		int poll_result;
-		//do {
-		//	poll_result = ibv_poll_cq(cq, 1, &wc);
-		//	//printf("Polling result\n");
-		//} while (poll_result == 0);
-		//if (poll_result > 0)
-		//{
-		//	printf("Received data is %s\n", send_buf);
-		//}
+		do {
+			poll_result = ibv_poll_cq(cq, 1, &wc);
+			//printf("Polling result\n");
+		} while (poll_result == 0);
+		if (poll_result > 0)
+		{
+			printf("Received data is %s\n", send_buf);
+		}
 	}
-	printf("Sync\n");
 	// synchronize here
 	if (mode == 's')
 	{
@@ -296,6 +296,7 @@ int main(int argc, char** argv)
 		write(sd, (char *)&local_conn_data, sizeof(rdma_conn_data_t));
 		read(sd, (char *)&tmp_conn_data, sizeof(rdma_conn_data_t));
 	}
+	printf("Sync\n");
 	if (mode == 'c')
 	{
 		printf("Content of buffer on client: %s\n", send_buf);
