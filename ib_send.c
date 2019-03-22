@@ -115,8 +115,8 @@ int main(int argc, char** argv)
 			.max_send_sge = 1,
 			.max_recv_sge = 1
 		},
-		.qp_type = IBV_QPT_RC,
-		.sq_sig_all = 1
+		.qp_type = IBV_QPT_RC//,
+		//.sq_sig_all = 1
 	};
 	qp = ibv_create_qp(pd, &init_attr);
 	if (!qp)
@@ -243,7 +243,8 @@ int main(int argc, char** argv)
 			.num_sge = 1,
 			.opcode = IBV_WR_RDMA_WRITE,
 			.wr.rdma.remote_addr = remote_conn_data.addr,
-			.wr.rdma.rkey = remote_conn_data.rkey
+			.wr.rdma.rkey = remote_conn_data.rkey,
+			.send_flags = IBV_SEND_SIGNALED
 		};
 		struct ibv_send_wr * bad_wr;
 		char * message = "hello world!";
@@ -278,12 +279,7 @@ int main(int argc, char** argv)
 		int poll_result;
 		do {
 			poll_result = ibv_poll_cq(cq, 1, &wc);
-			//printf("Polling result\n");
 		} while (poll_result == 0);
-		if (poll_result > 0)
-		{
-			printf("Received data is %s\n", send_buf);
-		}
 	}
 	// synchronize here
 	if (mode == 's')
