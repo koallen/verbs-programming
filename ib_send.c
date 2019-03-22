@@ -81,7 +81,11 @@ int main(int argc, char** argv)
 	}
 	
 	// register memory region
-	char send_buf[BUFSIZE];
+	char send_buf[BUFSIZE] = "initial content";
+	if (mode == 'c')
+	{
+		printf("Content of buffer on client: %s\n", send_buf);
+	}
 	struct ibv_mr * mr;
 	mr = ibv_reg_mr(pd, send_buf, BUFSIZE, IBV_ACCESS_REMOTE_WRITE |
 		IBV_ACCESS_LOCAL_WRITE);
@@ -126,7 +130,7 @@ int main(int argc, char** argv)
 	attr.qp_state = IBV_QPS_INIT;
 	attr.pkey_index = 0;
 	attr.port_num = 1;
-	attr.qp_access_flags = 0;
+	attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
 	if (ibv_modify_qp(qp, &attr,
 		IBV_QP_STATE |
 		IBV_QP_PKEY_INDEX |
@@ -139,6 +143,7 @@ int main(int argc, char** argv)
 
 	// exchange connection information
 	struct sockaddr_in address;
+	int sd, conn;
 	rdma_conn_data_t local_conn_data, remote_conn_data, tmp_conn_data;
 
 	local_conn_data.rkey = htonl(mr->rkey);
@@ -148,48 +153,45 @@ int main(int argc, char** argv)
 	if (mode == 's')
 	{
 		int addrlen = sizeof(address);
-		int sd = socket(AF_INET, SOCK_STREAM, 0);
+		sd = socket(AF_INET, SOCK_STREAM, 0);
 		address.sin_family = AF_INET;
 		address.sin_addr.s_addr = INADDR_ANY;
 		address.sin_port = htons(8999);
 		bind(sd, (struct sockaddr *)&address, sizeof(address));
 		listen(sd, 1);
 		printf("Waiting for client to connect at 0.0.0.0:8999\n");
-		int conn = accept(sd, NULL, 0);
+		conn = accept(sd, NULL, 0);
 		read(conn, (char *)&tmp_conn_data, sizeof(rdma_conn_data_t));
 		write(conn, (char *)&local_conn_data, sizeof(rdma_conn_data_t));
-		close(conn);
-		close(sd);
 	}
 	else
 	{
 		// prepare the buffer with rkey & memory addr
-		int sd = socket(AF_INET, SOCK_STREAM, 0);
+		sd = socket(AF_INET, SOCK_STREAM, 0);
 		address.sin_family = AF_INET;
 		address.sin_port = htons(atoi(argv[3]));
 		inet_pton(AF_INET, argv[2], &address.sin_addr);
 		connect(sd, (struct sockaddr *)&address, sizeof(address));
 		write(sd, (char *)&local_conn_data, sizeof(rdma_conn_data_t));
 		read(sd, (char *)&tmp_conn_data, sizeof(rdma_conn_data_t));
-		close(sd);
 	}
 	remote_conn_data.addr = ntohll(tmp_conn_data.addr);
 	remote_conn_data.rkey = ntohl(tmp_conn_data.rkey);
 	remote_conn_data.qp_num = ntohl(tmp_conn_data.qp_num);
 	remote_conn_data.lid = ntohs(tmp_conn_data.lid);
 	printf("Info exchange completed\n");
-	printf("local: %d, remote: %d\n", mr->rkey, remote_conn_data.rkey);
+	printf("%d %d\n", qp->qp_num, remote_conn_data.qp_num);
 
 	// change qp to RTR state
 	memset(&attr, 0, sizeof(attr));
 	attr.qp_state = IBV_QPS_RTR;
 	attr.path_mtu = IBV_MTU_256;
-	attr.dest_qp_num = 100;
+	attr.dest_qp_num = remote_conn_data.qp_num;
 	attr.rq_psn = 0;
 	attr.max_dest_rd_atomic = 1;
 	attr.min_rnr_timer = 0x12;
 	attr.ah_attr.is_global = 0;
-	attr.ah_attr.dlid = 178;
+	attr.ah_attr.dlid = remote_conn_data.lid;
 	attr.ah_attr.sl = 0;
 	attr.ah_attr.src_path_bits = 0;
 	attr.ah_attr.port_num = 1;
@@ -206,6 +208,12 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 
+	// send and recv
+	struct ibv_sge sg_list = {
+		.addr = (uint64_t)send_buf,
+		.length = BUFSIZE,
+		.lkey = mr->lkey
+	};
 	if (mode == 's')
 	{
 		// change qp to RTS state
@@ -228,11 +236,6 @@ int main(int argc, char** argv)
 			return EXIT_FAILURE;
 		}
 		// post send
-		struct ibv_sge sg_list = {
-			.addr = (uint64_t)send_buf,
-			.length = BUFSIZE,
-			.lkey = mr->lkey
-		};
 		struct ibv_send_wr send_wr = {
 			.next = NULL,
 			.sg_list = &sg_list,
@@ -243,7 +246,7 @@ int main(int argc, char** argv)
 		};
 		struct ibv_send_wr * bad_wr;
 		char * message = "hello world!";
-		strncpy(send_buf, message, 12);
+		strncpy(send_buf, message, 13);
 		if (ibv_post_send(qp, &send_wr, &bad_wr))
 		{
 			printf("ibv_post_send() failed.\n");
@@ -251,20 +254,57 @@ int main(int argc, char** argv)
 		}
 		printf("Sent message: %s\n", message);
 	}
-	else
+	//else
+	//{
+	//	struct ibv_recv_wr recv_wr = {
+	//		.next = NULL,
+	//		.wr_id = 0,
+	//		.sg_list = &sg_list,
+	//		.num_sge = 1
+	//	};
+	//	struct ibv_recv_wr * bad_wr;
+	//	if (ibv_post_recv(qp, &recv_wr, &bad_wr))
+	//	{
+	//		printf("ibv_post_recv() failed.\n");
+	//		return EXIT_FAILURE;
+	//	}
+	//}
+
+	// poll for completion on both sides
+	if (mode == 's')
 	{
 		struct ibv_wc wc;
 		int poll_result;
-		do {
-			poll_result = ibv_poll_cq(cq, 1, &wc);
-		} while (poll_result == 0);
-		if (poll_result > 0)
-		{
-			printf("Received data is %s\n", send_buf);
-		}
+		//do {
+		//	poll_result = ibv_poll_cq(cq, 1, &wc);
+		//	//printf("Polling result\n");
+		//} while (poll_result == 0);
+		//if (poll_result > 0)
+		//{
+		//	printf("Received data is %s\n", send_buf);
+		//}
+	}
+	printf("Sync\n");
+	// synchronize here
+	if (mode == 's')
+	{
+		read(conn, (char *)&tmp_conn_data, sizeof(rdma_conn_data_t));
+		write(conn, (char *)&local_conn_data, sizeof(rdma_conn_data_t));
+	}
+	else
+	{
+		write(sd, (char *)&local_conn_data, sizeof(rdma_conn_data_t));
+		read(sd, (char *)&tmp_conn_data, sizeof(rdma_conn_data_t));
+	}
+	if (mode == 'c')
+	{
+		printf("Content of buffer on client: %s\n", send_buf);
 	}
 	
 	// finalize everything
+	close(sd);
+	if (mode == 's')
+		close(conn);
 	ibv_destroy_qp(qp);
 	ibv_destroy_cq(cq);
 	ibv_dereg_mr(mr);
