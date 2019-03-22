@@ -180,8 +180,6 @@ int main(int argc, char** argv)
 	remote_conn_data.rkey = ntohl(tmp_conn_data.rkey);
 	remote_conn_data.qp_num = ntohl(tmp_conn_data.qp_num);
 	remote_conn_data.lid = ntohs(tmp_conn_data.lid);
-	printf("Info exchange completed\n");
-	printf("%d %d\n", qp->qp_num, remote_conn_data.qp_num);
 
 	// change qp to RTR state
 	memset(&attr, 0, sizeof(attr));
@@ -280,6 +278,13 @@ int main(int argc, char** argv)
 		do {
 			poll_result = ibv_poll_cq(cq, 1, &wc);
 		} while (poll_result == 0);
+		if (poll_result < 0)
+			fprintf(stderr, "ibv_poll_cq() failed\n");
+
+		if (wc.status != IBV_WC_SUCCESS)
+		{
+			fprintf(stderr, "Work completion failed with %s\n", ibv_wc_status_str(wc.status));
+		}
 	}
 	// synchronize here
 	if (mode == 's')
